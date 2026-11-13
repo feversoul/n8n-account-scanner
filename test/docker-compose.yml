@@ -1,0 +1,19 @@
+# Overlay for the end-to-end tests: n8n plus a stand-in for the model API with
+# web search. Paths are relative to the repository root.
+#   npm run test:e2e
+services:
+  standin:
+    image: node:22-alpine
+    command: ["node", "/app/stand-in.mjs"]
+    volumes:
+      - ./test/stand-in.mjs:/app/stand-in.mjs:ro
+    ports:
+      - "58098:8080"
+    mem_limit: 256m
+
+  n8n:
+    restart: "no"
+    depends_on:
+      standin:
+        condition: service_started
+    mem_limit: 1500m

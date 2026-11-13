@@ -1,0 +1,452 @@
+{
+  "name": "Account Scanner · Run by webhook",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Account Scanner · Run by webhook\nOptional. Needs a credential of type **Header Auth** named `Account Scanner Key` (header `X-Scanner-Key`).\n\n- `POST /webhook/scanner/run` with `{ \"location\", \"intent_signal\", \"lookback_hours\", \"runs\", \"target\", \"sub_areas\", \"concurrency\" }` runs *Account Scanner* and answers with the run summary when it is done. What you leave out comes from its Settings node.\n- `POST /webhook/scanner/rows` answers with everything in `scanner_companies` and `scanner_runs`.\n\nThe tests of this repository use both.",
+        "width": 640,
+        "height": 240,
+        "color": 4
+      },
+      "id": "08162c90-0e73-4caf-8611-221a88372212",
+      "name": "About",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -300
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "scanner/run",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "aab6ce84-ff3d-4424-89ff-4bcecaa20843",
+      "name": "Run requested",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "9fe31832-dd01-4ee8-8730-ee03a7ed797c",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "acctScannerKey",
+          "name": "Account Scanner Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "acctScannerMain01"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "id": "2b6bef63-4c69-46e1-874a-fc698b6d9bea",
+      "name": "Account Scanner",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "6889e6db-1e96-4b04-8478-e59eb45c9d6c",
+      "name": "Answer",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        480,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "scanner/rows",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "b1816435-ff44-4a82-8edf-5d8601f7eae1",
+      "name": "Rows requested",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        240
+      ],
+      "webhookId": "a05d2fcf-1366-433d-80cb-45e0fc264a36",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "acctScannerKey",
+          "name": "Account Scanner Key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "table",
+        "operation": "create",
+        "tableName": "scanner_companies",
+        "columns": {
+          "column": [
+            {
+              "name": "company",
+              "type": "string"
+            },
+            {
+              "name": "website",
+              "type": "string"
+            },
+            {
+              "name": "domain_key",
+              "type": "string"
+            },
+            {
+              "name": "name_key",
+              "type": "string"
+            },
+            {
+              "name": "signal",
+              "type": "string"
+            },
+            {
+              "name": "source_url",
+              "type": "string"
+            },
+            {
+              "name": "source_date",
+              "type": "string"
+            },
+            {
+              "name": "angle",
+              "type": "string"
+            },
+            {
+              "name": "location",
+              "type": "string"
+            },
+            {
+              "name": "intent_signal",
+              "type": "string"
+            },
+            {
+              "name": "run_id",
+              "type": "string"
+            },
+            {
+              "name": "found_at",
+              "type": "date"
+            }
+          ]
+        },
+        "options": {
+          "createIfNotExists": true
+        }
+      },
+      "id": "912939e0-02f7-4c96-8b0a-1bb38f0cc298",
+      "name": "Companies table",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        240,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "table",
+        "operation": "create",
+        "tableName": "scanner_runs",
+        "columns": {
+          "column": [
+            {
+              "name": "run_id",
+              "type": "string"
+            },
+            {
+              "name": "ran_at",
+              "type": "date"
+            },
+            {
+              "name": "location",
+              "type": "string"
+            },
+            {
+              "name": "intent_signal",
+              "type": "string"
+            },
+            {
+              "name": "lookback_hours",
+              "type": "number"
+            },
+            {
+              "name": "stopped",
+              "type": "string"
+            },
+            {
+              "name": "angles_planned",
+              "type": "number"
+            },
+            {
+              "name": "angles_tried",
+              "type": "number"
+            },
+            {
+              "name": "found",
+              "type": "number"
+            },
+            {
+              "name": "rejected",
+              "type": "number"
+            },
+            {
+              "name": "duplicates",
+              "type": "number"
+            },
+            {
+              "name": "retries",
+              "type": "number"
+            },
+            {
+              "name": "model_calls",
+              "type": "number"
+            },
+            {
+              "name": "web_searches",
+              "type": "number"
+            },
+            {
+              "name": "input_tokens",
+              "type": "number"
+            },
+            {
+              "name": "output_tokens",
+              "type": "number"
+            },
+            {
+              "name": "total_tokens",
+              "type": "number"
+            },
+            {
+              "name": "report",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {
+          "createIfNotExists": true
+        }
+      },
+      "id": "49638b40-7b6a-4905-88b9-2162e87dcadb",
+      "name": "Runs table",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        460,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "scanner_companies"
+        },
+        "matchType": "allConditions",
+        "filters": {},
+        "returnAll": true
+      },
+      "id": "e10d986d-318b-4955-8b9d-750582006331",
+      "name": "Companies",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        680,
+        240
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "scanner_runs"
+        },
+        "matchType": "allConditions",
+        "filters": {},
+        "returnAll": true
+      },
+      "id": "d116e246-1b4f-431c-859f-cec0ee567dae",
+      "name": "Runs",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        900,
+        240
+      ],
+      "alwaysOutputData": true,
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Everything in the two data tables, for a look from outside n8n.\nconst rows = (name) => $(name).all().map((item) => item.json).filter((row) => row && row.run_id);\nreturn [{ json: { companies: rows('Companies'), runs: rows('Runs') } }];"
+      },
+      "id": "8c35ec42-a8be-4df6-8480-b9e962bb9f87",
+      "name": "Rows out",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "cd77f3b4-255f-4c16-8656-6a17622a3175",
+      "name": "Answer rows",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1340,
+        240
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Run requested": {
+      "main": [
+        [
+          {
+            "node": "Account Scanner",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Account Scanner": {
+      "main": [
+        [
+          {
+            "node": "Answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rows requested": {
+      "main": [
+        [
+          {
+            "node": "Companies table",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Companies table": {
+      "main": [
+        [
+          {
+            "node": "Runs table",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Runs table": {
+      "main": [
+        [
+          {
+            "node": "Companies",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Companies": {
+      "main": [
+        [
+          {
+            "node": "Runs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Runs": {
+      "main": [
+        [
+          {
+            "node": "Rows out",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rows out": {
+      "main": [
+        [
+          {
+            "node": "Answer rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "id": "acctScannerHook01"
+}

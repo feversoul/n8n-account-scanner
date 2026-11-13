@@ -1,0 +1,34 @@
+# n8n with the two workflows already imported, to try it locally.
+#   cp .env.example .env   (fill it in)   then   docker compose up -d
+# Already have n8n (your own server or Cloud)? You do not need this file: see
+# "Add it to your n8n" in the README.
+
+services:
+  n8n:
+    image: ${N8N_IMAGE:-n8nio/n8n:2.47.7}
+    restart: unless-stopped
+    entrypoint: ["sh", "/bootstrap/bootstrap.sh"]
+    environment:
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?set N8N_ENCRYPTION_KEY in .env}
+      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-UTC}
+      # The secret for the optional webhooks (header X-Scanner-Key).
+      SCANNER_KEY: ${SCANNER_KEY:?set SCANNER_KEY in .env}
+      # The model API: base address without /responses, model name, key.
+      MODEL_BASE_URL: ${MODEL_BASE_URL:-}
+      MODEL: ${MODEL:-}
+      MODEL_API_KEY: ${MODEL_API_KEY:-none}
+      # Optional: what "Execute workflow" searches for when nothing else is given.
+      LOCATION: ${LOCATION:-}
+      INTENT_SIGNAL: ${INTENT_SIGNAL:-}
+      # Optional: seconds before a failed model call is tried again (default 10).
+      RETRY_WAIT_SECONDS: ${RETRY_WAIT_SECONDS:-}
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./workflows:/bootstrap/workflows:ro
+      - ./docker/bootstrap.sh:/bootstrap/bootstrap.sh:ro
+      - ./docker/prepare.mjs:/bootstrap/prepare.mjs:ro
+    ports:
+      - "${N8N_PORT:-5678}:5678"
+
+volumes:
+  n8n_data:

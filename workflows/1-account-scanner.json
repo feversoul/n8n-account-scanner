@@ -1,0 +1,1306 @@
+{
+  "name": "Account Scanner",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Account Scanner\nOne click instead of 50 chats. It plans N different **search angles** for your location and intent signal, asks a model with **web search** once per angle, and keeps only companies that are new and come with a fresh source.\n\n1. **Settings**: what to look for, the model, the pace. Start here.\n2. **Plan angles**: N angles that differ in area, industry, kind of source and wording. It also reads what earlier runs found.\n3. **The loop** (Next batch → Search the web → Read answers): a few angles at a time. Every batch is told which companies are already on the list, so it looks somewhere new. The loop ends when the target is reached or the angles are used up.\n4. **Read answers** rejects an answer without a source, with a source older than the lookback window, or with a source the web search did not return. A company that is already known (same website, or same name when there is no website) is dropped.\n5. New companies go to the data table `scanner_companies`, the run goes to `scanner_runs`. Both tables are created on the first run.\n\nPress **Execute workflow** to run with the values in Settings, or publish the workflow and open the form.\n\n**Check before you use a row.** A model can still name a company or a source that is wrong. Every row has its `source_url`: open it.",
+        "width": 900,
+        "height": 460,
+        "color": 4
+      },
+      "id": "9d638207-afef-4e0a-83d9-3eafcea13b4c",
+      "name": "About",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -80,
+        -660
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "115a4e1f-8d43-4a64-8468-7ba5b8226611",
+      "name": "Run by hand",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        -180
+      ]
+    },
+    {
+      "parameters": {
+        "formTitle": "Account Scanner",
+        "formDescription": "Finds companies with a fresh intent signal. Empty fields use the values in the Settings node. The results go to the data table scanner_companies.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Location",
+              "placeholder": "Austin, Texas",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Intent signal",
+              "placeholder": "announced a new funding round",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Lookback hours",
+              "fieldType": "number",
+              "placeholder": "96"
+            },
+            {
+              "fieldLabel": "Runs",
+              "fieldType": "number",
+              "placeholder": "50"
+            },
+            {
+              "fieldLabel": "Target",
+              "fieldType": "number",
+              "placeholder": "40"
+            },
+            {
+              "fieldLabel": "Sub-areas",
+              "placeholder": "optional, comma separated"
+            }
+          ]
+        },
+        "responseMode": "onReceived",
+        "options": {
+          "path": "account-scanner"
+        }
+      },
+      "id": "729bab65-7480-46d4-82cc-e62525c3fa40",
+      "name": "Or fill in the form",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "d388c0bc-e4cc-4e79-85d7-cd6dd93db738"
+    },
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "104ed9e9-0029-4dc4-807a-2cc12ad26541",
+      "name": "Called by another workflow",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Change these, then save. The form and the webhook can send their own\n// location, intent signal, lookback hours, runs, target and sub-areas; what\n// they leave out comes from here. \"Execute workflow\" uses these values as is.\n\n// --- what to look for ---\nconst LOCATION = 'Austin, Texas';\nconst INTENT_SIGNAL = 'announced a new funding round';\nconst LOOKBACK_HOURS = 96; // a source older than this is rejected\nconst RUNS = 50; // how many search angles to plan (your \"50 chats\")\nconst TARGET = 40; // stop as soon as this many new companies are found\nconst SUB_AREAS = ''; // optional, comma separated: 'Downtown, East Austin, Round Rock'. Empty = generic areas.\n\n// --- the model ---\n// An API that speaks the OpenAI Responses format with the built-in web search\n// tool. The key is in the credential \"Account Scanner Model\".\nconst MODEL_BASE_URL = 'https://api.openai.com/v1'; // without /responses\nconst MODEL = 'gpt-6-astra'; // any model that supports the web_search tool\nconst STRUCTURED_OUTPUT = true; // send the JSON schema with the request. Set to false if your server rejects \"text.format\".\n// Is the source the model names a page its web search really returned?\n//   'url'    the exact page must be among the citations or sources of the answer\n//   'domain' its website must be among them\n//   'off'    do not check\nconst CITED_SOURCE_CHECK = 'url';\n\n// --- pace ---\nconst CONCURRENCY = 5; // model calls at the same time. Each batch gets the companies found by the batches before it.\nconst PAUSE_BETWEEN_BATCHES_SECONDS = 0;\nconst MAX_ATTEMPTS = 3; // tries per angle when the API says \"too many requests\" or is down\nconst RETRY_WAIT_SECONDS = 10; // doubled per attempt; a Retry-After header from the API wins\nconst MAX_WAIT_SECONDS = 60;\nconst EXCLUDE_LIST_MAX = 200; // how many known companies the prompt lists (newest first). Dedupe always checks all of them.\nconst MAX_RUNS = 200;\n\n// ---------------------------------------------------------------------------\nconst first = $input.first().json ?? {};\nconst raw = first.body && typeof first.body === 'object' ? first.body : first;\nconst sent = {};\nfor (const [key, value] of Object.entries(raw)) sent[key.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '')] = value;\n// The form hands over an empty number field as 0: that means \"not filled in\".\nconst fromForm = 'submittedAt' in first || 'formMode' in first;\nconst given = (value) => value !== undefined && value !== null && String(value).trim() !== '' && !(fromForm && value === 0);\nconst pick = (...names) => {\n  for (const name of names) if (given(sent[name])) return sent[name];\n  return undefined;\n};\nconst text = (value, fallback) => String(value ?? fallback).trim();\nconst number = (value, fallback) => (value === undefined ? fallback : Number(value));\n\nreturn [\n  {\n    json: {\n      location: text(pick('location'), LOCATION),\n      intent_signal: text(pick('intent_signal', 'signal'), INTENT_SIGNAL),\n      lookback_hours: number(pick('lookback_hours', 'lookback'), LOOKBACK_HOURS),\n      runs: number(pick('runs', 'number_of_runs'), RUNS),\n      target: number(pick('target', 'target_count'), TARGET),\n      sub_areas: text(pick('sub_areas'), SUB_AREAS),\n      concurrency: number(pick('concurrency'), CONCURRENCY),\n      model_base_url: MODEL_BASE_URL.replace(/\\/+$/, ''),\n      model: MODEL,\n      structured_output: STRUCTURED_OUTPUT,\n      cited_source_check: CITED_SOURCE_CHECK,\n      pause_seconds: PAUSE_BETWEEN_BATCHES_SECONDS,\n      max_attempts: MAX_ATTEMPTS,\n      retry_wait_seconds: RETRY_WAIT_SECONDS,\n      max_wait_seconds: MAX_WAIT_SECONDS,\n      exclude_list_max: EXCLUDE_LIST_MAX,\n      max_runs: MAX_RUNS,\n    },\n  },\n];"
+      },
+      "id": "073ca6d5-fe35-4022-85ea-87c9111ee430",
+      "name": "Settings",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "table",
+        "operation": "create",
+        "tableName": "scanner_companies",
+        "columns": {
+          "column": [
+            {
+              "name": "company",
+              "type": "string"
+            },
+            {
+              "name": "website",
+              "type": "string"
+            },
+            {
+              "name": "domain_key",
+              "type": "string"
+            },
+            {
+              "name": "name_key",
+              "type": "string"
+            },
+            {
+              "name": "signal",
+              "type": "string"
+            },
+            {
+              "name": "source_url",
+              "type": "string"
+            },
+            {
+              "name": "source_date",
+              "type": "string"
+            },
+            {
+              "name": "angle",
+              "type": "string"
+            },
+            {
+              "name": "location",
+              "type": "string"
+            },
+            {
+              "name": "intent_signal",
+              "type": "string"
+            },
+            {
+              "name": "run_id",
+              "type": "string"
+            },
+            {
+              "name": "found_at",
+              "type": "date"
+            }
+          ]
+        },
+        "options": {
+          "createIfNotExists": true
+        }
+      },
+      "id": "598d918c-73b3-40ff-8420-2db088a01105",
+      "name": "Companies table",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        460,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "table",
+        "operation": "create",
+        "tableName": "scanner_runs",
+        "columns": {
+          "column": [
+            {
+              "name": "run_id",
+              "type": "string"
+            },
+            {
+              "name": "ran_at",
+              "type": "date"
+            },
+            {
+              "name": "location",
+              "type": "string"
+            },
+            {
+              "name": "intent_signal",
+              "type": "string"
+            },
+            {
+              "name": "lookback_hours",
+              "type": "number"
+            },
+            {
+              "name": "stopped",
+              "type": "string"
+            },
+            {
+              "name": "angles_planned",
+              "type": "number"
+            },
+            {
+              "name": "angles_tried",
+              "type": "number"
+            },
+            {
+              "name": "found",
+              "type": "number"
+            },
+            {
+              "name": "rejected",
+              "type": "number"
+            },
+            {
+              "name": "duplicates",
+              "type": "number"
+            },
+            {
+              "name": "retries",
+              "type": "number"
+            },
+            {
+              "name": "model_calls",
+              "type": "number"
+            },
+            {
+              "name": "web_searches",
+              "type": "number"
+            },
+            {
+              "name": "input_tokens",
+              "type": "number"
+            },
+            {
+              "name": "output_tokens",
+              "type": "number"
+            },
+            {
+              "name": "total_tokens",
+              "type": "number"
+            },
+            {
+              "name": "report",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {
+          "createIfNotExists": true
+        }
+      },
+      "id": "4fccc222-a946-494f-8576-57cf08cbd83f",
+      "name": "Runs table",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        680,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "scanner_companies"
+        },
+        "matchType": "allConditions",
+        "filters": {},
+        "returnAll": true
+      },
+      "id": "d0ef30ab-cd52-4036-8e30-33161fa8e62d",
+      "name": "Earlier companies",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        900,
+        0
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Plans the run: N search angles that all differ, and what is already known\n// from earlier runs. One item comes out: the state that travels round the loop.\n//\n// An angle is one value from each list below. The lists have 4, 25, 9 and 7\n// entries, numbers that share no divisor, so angle 1, 2, 3 ... change in every\n// respect at once and no combination repeats before 6,300 angles. Edit the\n// lists to fit your market; any lengths work, the planner skips repeats.\n\nconst AREAS = (location) => [\n  `anywhere in ${location}`,\n  `the centre of ${location}`,\n  `the outskirts, suburbs and business parks of ${location}`,\n  `smaller towns and districts in and around ${location}`,\n];\nconst INDUSTRIES = [\n  'software and SaaS', 'healthcare and medical practices', 'manufacturing', 'construction and building trades', 'retail and e-commerce',\n  'financial services and fintech', 'logistics and transport', 'food and beverage', 'professional services (legal, accounting, consulting)', 'real estate and property',\n  'energy and utilities', 'education and training', 'hospitality, travel and leisure', 'biotech and life sciences', 'media, marketing and advertising',\n  'telecoms and IT services', 'automotive and mobility', 'agriculture and food production', 'non-profits and public sector suppliers', 'consumer goods',\n  'hardware, electronics and robotics', 'insurance', 'security and defence', 'sports, fitness and wellness', 'any industry not usually in the news',\n];\nconst SOURCES = [\n  'local and regional news sites', 'press release wires', \"the company's own newsroom or blog\", 'LinkedIn posts by the company or its leaders', 'trade and industry publications',\n  'business journals and startup news', 'job boards and careers pages', 'public filings, registries and government notices', 'newsletters, podcasts and community forums',\n];\nconst WORDINGS = (signal) => [\n  `${signal}`,\n  `an official announcement of: ${signal}`,\n  `news coverage reporting: ${signal}`,\n  `a founder or executive writing about: ${signal}`,\n  `early signs (job ads, filings, permits, supplier notices) of: ${signal}`,\n  `the same thing described in other words or in the local language: ${signal}`,\n  `a customer, partner or investor mentioning: ${signal}`,\n];\n\n// How two answers are recognised as the same company. Shared by \"Plan angles\"\n// and \"Read answers\" (scripts/build.mjs copies it into both).\n//   domainKey('https://www.Acme.io/about') -> 'acme.io'\n//   nameKey('ACME, Inc.')                  -> 'acme'\n// A profile on a shared site (LinkedIn, Crunchbase, ...) is not a company\n// website, so it gives no domain key and the name decides.\nconst SHARED_HOSTS = ['linkedin.com', 'facebook.com', 'x.com', 'twitter.com', 'instagram.com', 'youtube.com', 'tiktok.com', 'crunchbase.com', 'wikipedia.org', 'google.com', 'medium.com', 'substack.com', 'github.com', 'linktr.ee', 'bit.ly', 'wordpress.com', 'blogspot.com', 'wixsite.com', 'notion.site', 'glassdoor.com', 'indeed.com', 'yelp.com', 'bloomberg.com', 'pitchbook.com'];\nconst SITE_PREFIXES = ['www', 'www2', 'careers', 'jobs', 'blog', 'news', 'newsroom', 'press', 'investors', 'ir', 'about', 'shop', 'store', 'app', 'en', 'm'];\nconst LEGAL_WORDS = ['inc', 'incorporated', 'llc', 'ltd', 'limited', 'corp', 'corporation', 'co', 'company', 'plc', 'gmbh', 'ag', 'sa', 'sas', 'srl', 'bv', 'nv', 'ab', 'as', 'oy', 'pty', 'pte', 'lp', 'llp', 'group', 'holdings'];\n\nfunction domainKey(website) {\n  let host = String(website ?? '').trim().toLowerCase();\n  host = host.replace(/^[a-z][a-z0-9+.-]*:\\/\\//, '').split(/[/?#]/)[0].replace(/^.*@/, '').replace(/:\\d+$/, '').replace(/\\.$/, '');\n  if (!/^[a-z0-9-]+(\\.[a-z0-9-]+)+$/.test(host)) return '';\n  let labels = host.split('.');\n  while (labels.length > 2 && SITE_PREFIXES.includes(labels[0])) labels = labels.slice(1);\n  host = labels.join('.');\n  if (SHARED_HOSTS.some((shared) => host === shared || host.endsWith(`.${shared}`))) return '';\n  return host;\n}\n\nfunction nameKey(name) {\n  const words = String(name ?? '')\n    .normalize('NFKD')\n    .replace(/[̀-ͯ]/g, '')\n    .toLowerCase()\n    .replace(/&/g, ' and ')\n    .replace(/[^\\p{L}\\p{N}]+/gu, ' ')\n    .trim()\n    .split(' ')\n    .filter(Boolean);\n  while (words.length > 1 && LEGAL_WORDS.includes(words[words.length - 1])) words.pop();\n  if (words.length > 1 && words[0] === 'the') words.shift();\n  return words.join(' ');\n}\n\nconst settings = $('Settings').first().json;\nconst whole = (value) => (Number.isFinite(value) ? Math.floor(value) : NaN);\nconst runs = whole(settings.runs);\nconst target = whole(settings.target);\nconst hours = Number(settings.lookback_hours);\n\nlet error = null;\nif (!settings.location || !settings.intent_signal) error = 'location and intent_signal are required';\nelse if (!(runs >= 1)) error = 'runs must be 1 or more';\nelse if (!(target >= 1)) error = 'target must be 1 or more';\nelse if (!(hours > 0)) error = 'lookback_hours must be more than 0';\n\n// --- the angles ---\nconst angles = [];\nif (!error) {\n  const own = settings.sub_areas.split(',').map((area) => area.trim()).filter(Boolean);\n  const areas = own.length ? own.map((area) => `${area} (${settings.location})`) : AREAS(settings.location);\n  const wordings = WORDINGS(settings.intent_signal);\n  const used = new Set();\n  const wanted = Math.min(runs, settings.max_runs);\n  for (let i = 0; angles.length < wanted && i < wanted * 20; i++) {\n    const angle = { area: areas[i % areas.length], industry: INDUSTRIES[i % INDUSTRIES.length], source: SOURCES[i % SOURCES.length], wording: wordings[i % wordings.length] };\n    const key = [angle.area, angle.industry, angle.source, angle.wording].join('|');\n    if (used.has(key)) continue;\n    used.add(key);\n    angles.push(angle);\n  }\n}\n\n// --- what earlier runs found ---\nconst earlier = $input\n  .all()\n  .map((item) => item.json)\n  .filter((row) => row && row.company)\n  .sort((a, b) => String(b.found_at ?? '').localeCompare(String(a.found_at ?? '')));\nconst domains = [];\nconst names = [];\nfor (const row of earlier) {\n  const d = row.domain_key || domainKey(row.website);\n  const n = row.name_key || nameKey(row.company);\n  if (d) domains.push([d, 'earlier']);\n  if (n) names.push([n, 'earlier', Boolean(d)]);\n}\n\nconst concurrency = Math.max(1, Math.min(whole(settings.concurrency) || 1, 20));\nconst started = Date.now();\nreturn [\n  {\n    json: {\n      run_id: `${$now.toFormat('yyyyLLdd-HHmmss')}-${$execution.id}`,\n      started_at: new Date(started).toISOString(),\n      cutoff_at: new Date(started - hours * 3600 * 1000).toISOString(),\n      settings: { ...settings, runs, target, lookback_hours: hours },\n      error,\n      angles,\n      queue: angles.map((_, index) => index), // angles still to ask, by position\n      attempts: {}, // angle position -> calls made\n      concurrency,\n      start_concurrency: concurrency,\n      batch: 0,\n      wait_seconds: 0,\n      more: !error && angles.length > 0,\n      stopped: error ? 'invalid_input' : null,\n      earlier_count: earlier.length,\n      exclude_earlier: earlier.slice(0, settings.exclude_list_max).map((row) => (row.domain_key ? `${row.company} (${row.domain_key})` : row.company)),\n      domains,\n      names,\n      found: [],\n      log: [],\n      model_calls: 0,\n      web_searches: 0,\n      input_tokens: 0,\n      output_tokens: 0,\n      total_tokens: 0,\n    },\n  },\n];"
+      },
+      "id": "6b0723e4-508f-4a15-8ae1-0696f76fc179",
+      "name": "Plan angles",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "a8a9bd28-ca36-48b8-8967-3c4afd577619",
+              "leftValue": "={{ $json.more }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {
+          "looseTypeValidation": true
+        }
+      },
+      "id": "dcec71ef-f2cf-4f53-84a6-15b3c69d34a8",
+      "name": "Anything to search?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1340,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Takes the next few angles from the queue and writes one request per angle.\n// Every request lists the companies that are already known: those of earlier\n// runs and those the batches before this one found. That list is what makes\n// the later calls look somewhere new instead of returning the same names.\n//\n// The request follows OpenAI's Responses API with the built-in web search tool:\n// https://developers.openai.com/api/docs/guides/tools-web-search\nconst state = $input.first().json;\nconst s = state.settings;\n\nconst exclude = [...state.found.map((row) => (row.domain_key ? `${row.company} (${row.domain_key})` : row.company)).reverse(), ...state.exclude_earlier].slice(0, s.exclude_list_max);\n\nconst SYSTEM = [\n  'You find companies for a sales prospect list by searching the web.',\n  'Always search the web before you answer. Never answer from memory.',\n  'Report exactly one company, and only if a page you found in this search shows the signal. That page is your source: give its exact URL and the date it was published.',\n  'If you find no company that fits, answer with an empty string in every field. An empty answer is better than a guess.',\n  'Answer with one JSON object and nothing else: {\"company\": \"\", \"website\": \"\", \"signal\": \"\", \"source_url\": \"\", \"source_date\": \"\"}',\n  \"company: the company's name. website: its own website, not a social profile. signal: one sentence on what happened. source_url: the page that shows it. source_date: when that page was published, as YYYY-MM-DD or a full ISO 8601 time.\",\n].join('\\n');\n\nconst SCHEMA = {\n  type: 'object',\n  properties: {\n    company: { type: 'string' },\n    website: { type: 'string' },\n    signal: { type: 'string' },\n    source_url: { type: 'string' },\n    source_date: { type: 'string' },\n  },\n  required: ['company', 'website', 'signal', 'source_url', 'source_date'],\n  additionalProperties: false,\n};\n\nconst take = state.queue.slice(0, state.concurrency);\nreturn take.map((index, position) => {\n  const angle = state.angles[index];\n  const prompt = [\n    `Search angle ${index + 1} of ${state.angles.length}.`,\n    `Find one company in ${s.location} with this signal: ${s.intent_signal}`,\n    `The source must be published after ${state.cutoff_at} (the last ${s.lookback_hours} hours; it is now ${state.started_at}).`,\n    `Where to look: ${angle.area}`,\n    `Industry: ${angle.industry}`,\n    `Kind of source: ${angle.source}`,\n    `How the signal may show up: ${angle.wording}`,\n    '',\n    exclude.length ? 'Already on the list. Do not report these again, find a different company:' : 'Nothing is on the list yet.',\n    ...exclude.map((entry) => `- ${entry}`),\n  ].join('\\n');\n\n  const request = {\n    model: s.model,\n    input: [\n      { role: 'system', content: SYSTEM },\n      { role: 'user', content: prompt },\n    ],\n    tools: [{ type: 'web_search' }],\n    tool_choice: 'required', // the search must run\n    include: ['web_search_call.action.sources'], // every URL the search read, to check the source against\n  };\n  if (s.structured_output) request.text = { format: { type: 'json_schema', name: 'company_signal', schema: SCHEMA, strict: true } };\n\n  return {\n    json: {\n      angle_index: index,\n      attempt: (state.attempts[index] ?? 0) + 1,\n      wait_seconds: state.wait_seconds,\n      request,\n      // The whole state rides on the first item, so \"Read answers\" can pick it up after the HTTP node.\n      ...(position === 0 ? { state } : {}),\n    },\n  };\n});"
+      },
+      "id": "e5c04424-283c-4f57-895b-c8b8dbbe5761",
+      "name": "Next batch",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1600,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c0a4becb-74f8-44ae-86bb-a6244d37d2fc",
+              "leftValue": "={{ $json.wait_seconds > 0 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {
+          "looseTypeValidation": true
+        }
+      },
+      "id": "b8e051f0-55a4-49b4-8e1c-7095a6647bbf",
+      "name": "Pause first?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1820,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "amount": "={{ $json.wait_seconds }}",
+        "unit": "seconds"
+      },
+      "id": "ce89d1d2-f166-41b4-8633-474c2198a436",
+      "name": "Wait",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2040,
+        -240
+      ],
+      "webhookId": "c8bded7c-b2ea-45c5-89b8-30520aaa61b0"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Settings').first().json.model_base_url }}/responses",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.request) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 180000
+        }
+      },
+      "id": "bf5bcf34-fef9-451b-8e27-36ef882f4f72",
+      "name": "Search the web",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2260,
+        -100
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "acctScannerModel",
+          "name": "Account Scanner Model"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Reads the answers of one batch, in the order they were asked, and decides\n// per answer: found, rejected (with the reason), duplicate, or try again.\n// One item comes out: the state for the next round.\n//\n// Response shape (OpenAI Responses API with web search):\n//   output[]: { type: 'web_search_call', action: { type: 'search', sources: [{ url }] } }\n//             { type: 'message', content: [{ type: 'output_text', text, annotations: [{ type: 'url_citation', url }] }] }\n//   usage:    { input_tokens, output_tokens, total_tokens }\nconst batch = $('Next batch').all();\nconst answers = $input.all();\nconst state = JSON.parse(JSON.stringify(batch[0].json.state));\nconst s = state.settings;\n\n// How two answers are recognised as the same company. Shared by \"Plan angles\"\n// and \"Read answers\" (scripts/build.mjs copies it into both).\n//   domainKey('https://www.Acme.io/about') -> 'acme.io'\n//   nameKey('ACME, Inc.')                  -> 'acme'\n// A profile on a shared site (LinkedIn, Crunchbase, ...) is not a company\n// website, so it gives no domain key and the name decides.\nconst SHARED_HOSTS = ['linkedin.com', 'facebook.com', 'x.com', 'twitter.com', 'instagram.com', 'youtube.com', 'tiktok.com', 'crunchbase.com', 'wikipedia.org', 'google.com', 'medium.com', 'substack.com', 'github.com', 'linktr.ee', 'bit.ly', 'wordpress.com', 'blogspot.com', 'wixsite.com', 'notion.site', 'glassdoor.com', 'indeed.com', 'yelp.com', 'bloomberg.com', 'pitchbook.com'];\nconst SITE_PREFIXES = ['www', 'www2', 'careers', 'jobs', 'blog', 'news', 'newsroom', 'press', 'investors', 'ir', 'about', 'shop', 'store', 'app', 'en', 'm'];\nconst LEGAL_WORDS = ['inc', 'incorporated', 'llc', 'ltd', 'limited', 'corp', 'corporation', 'co', 'company', 'plc', 'gmbh', 'ag', 'sa', 'sas', 'srl', 'bv', 'nv', 'ab', 'as', 'oy', 'pty', 'pte', 'lp', 'llp', 'group', 'holdings'];\n\nfunction domainKey(website) {\n  let host = String(website ?? '').trim().toLowerCase();\n  host = host.replace(/^[a-z][a-z0-9+.-]*:\\/\\//, '').split(/[/?#]/)[0].replace(/^.*@/, '').replace(/:\\d+$/, '').replace(/\\.$/, '');\n  if (!/^[a-z0-9-]+(\\.[a-z0-9-]+)+$/.test(host)) return '';\n  let labels = host.split('.');\n  while (labels.length > 2 && SITE_PREFIXES.includes(labels[0])) labels = labels.slice(1);\n  host = labels.join('.');\n  if (SHARED_HOSTS.some((shared) => host === shared || host.endsWith(`.${shared}`))) return '';\n  return host;\n}\n\nfunction nameKey(name) {\n  const words = String(name ?? '')\n    .normalize('NFKD')\n    .replace(/[̀-ͯ]/g, '')\n    .toLowerCase()\n    .replace(/&/g, ' and ')\n    .replace(/[^\\p{L}\\p{N}]+/gu, ' ')\n    .trim()\n    .split(' ')\n    .filter(Boolean);\n  while (words.length > 1 && LEGAL_WORDS.includes(words[words.length - 1])) words.pop();\n  if (words.length > 1 && words[0] === 'the') words.shift();\n  return words.join(' ');\n}\n\nconst DAY = 24 * 3600 * 1000;\nconst started = Date.parse(state.started_at);\nconst cutoff = Date.parse(state.cutoff_at);\nconst domains = new Map(state.domains.map(([key, where]) => [key, where]));\nconst names = new Map(state.names.map(([key, where, hasDomain]) => [key, { where, hasDomain }]));\n\n// The JSON object in the answer text. Code fences, text around the JSON and a\n// comma before a closing bracket are repaired; anything else is not usable.\nfunction readJson(text) {\n  const trimmed = String(text ?? '').trim();\n  const attempts = [trimmed];\n  const fenced = /```(?:json)?\\s*([\\s\\S]*?)```/i.exec(trimmed)?.[1];\n  if (fenced) attempts.push(fenced.trim());\n  const body = fenced ?? trimmed;\n  const from = body.search(/[{[]/);\n  const to = Math.max(body.lastIndexOf('}'), body.lastIndexOf(']'));\n  if (from !== -1 && to > from) attempts.push(body.slice(from, to + 1), body.slice(from, to + 1).replace(/,\\s*([}\\]])/g, '$1'));\n  for (const attempt of attempts) {\n    try {\n      let value = JSON.parse(attempt);\n      if (value && Array.isArray(value.companies)) value = value.companies;\n      if (Array.isArray(value)) value = value[0] ?? {};\n      if (value && typeof value === 'object') return value;\n    } catch {\n      /* try the next one */\n    }\n  }\n  return null;\n}\n\n// A page address without the parts that differ between two links to the same page.\nfunction pageKey(url) {\n  const match = /^https?:\\/\\/([^/?#]+)([^?#]*)/i.exec(String(url ?? '').trim());\n  if (!match) return '';\n  return `${match[1].toLowerCase().replace(/^www\\./, '')}${match[2].replace(/\\/+$/, '')}`;\n}\nconst hostOf = (url) => pageKey(url).split('/')[0];\n\n// When the source was published, in milliseconds. A date without a time counts\n// as the end of that day, so a source from the edge of the window is kept.\nfunction publishedAt(value) {\n  const text = String(value ?? '').trim();\n  if (!text) return null;\n  const day = /^(\\d{4})-(\\d{2})-(\\d{2})$/.exec(text);\n  if (day) return Date.UTC(Number(day[1]), Number(day[2]) - 1, Number(day[3])) + DAY - 1;\n  const time = Date.parse(text);\n  if (Number.isNaN(time)) return null;\n  return /\\d:\\d\\d/.test(text) ? time : time + DAY - 1;\n}\n\nconst clean = (value) => (typeof value === 'string' ? value.trim() : value === null || value === undefined ? '' : String(value).trim());\n\n// Returns { outcome: 'found' | 'rejected' | 'duplicate', reason, row }\nfunction judge(body, angle) {\n  const output = Array.isArray(body?.output) ? body.output : [];\n  const searches = output.filter((entry) => entry?.type === 'web_search_call');\n  const parts = output.filter((entry) => entry?.type === 'message').flatMap((entry) => (Array.isArray(entry.content) ? entry.content : []));\n  if (parts.some((part) => part?.type === 'refusal')) return { outcome: 'rejected', reason: 'refused' };\n  const texts = parts.filter((part) => part?.type === 'output_text');\n  const answer = readJson(texts.map((part) => part.text ?? '').join('\\n'));\n  if (!answer) return { outcome: 'bad_json' };\n\n  const row = {\n    company: clean(answer.company),\n    website: clean(answer.website),\n    signal: clean(answer.signal),\n    source_url: clean(answer.source_url),\n    source_date: clean(answer.source_date),\n  };\n  if (!row.company) return { outcome: 'rejected', reason: 'nothing_found', row };\n  if (!/^https?:\\/\\/[^\\s/]+\\.[^\\s/]+/i.test(row.source_url)) return { outcome: 'rejected', reason: 'no_source', row };\n\n  if (s.cited_source_check !== 'off') {\n    if (searches.length === 0) return { outcome: 'rejected', reason: 'no_web_search', row };\n    const cited = [\n      ...texts.flatMap((part) => (Array.isArray(part.annotations) ? part.annotations : [])).filter((note) => note?.type === 'url_citation').map((note) => note.url),\n      ...searches.flatMap((search) => (Array.isArray(search.action?.sources) ? search.action.sources : [])).map((source) => source?.url),\n    ].filter(Boolean);\n    const ok = s.cited_source_check === 'domain' ? cited.some((url) => hostOf(url) === hostOf(row.source_url)) : cited.some((url) => pageKey(url) === pageKey(row.source_url));\n    if (!ok) return { outcome: 'rejected', reason: 'source_not_in_search', row };\n  }\n\n  const published = publishedAt(row.source_date);\n  if (published === null) return { outcome: 'rejected', reason: 'no_source_date', row };\n  if (published < cutoff) return { outcome: 'rejected', reason: 'stale_source', row };\n  if (published > started + 2 * DAY) return { outcome: 'rejected', reason: 'source_date_in_future', row };\n\n  // Same company? The website's domain decides. The name decides only when\n  // one of the two has no usable website.\n  row.domain_key = domainKey(row.website);\n  row.name_key = nameKey(row.company);\n  let known = null;\n  if (row.domain_key && domains.has(row.domain_key)) known = domains.get(row.domain_key);\n  else if (row.name_key && names.has(row.name_key) && (!row.domain_key || !names.get(row.name_key).hasDomain)) known = names.get(row.name_key).where;\n  if (known) return { outcome: 'duplicate', reason: known === 'earlier' ? 'found_in_earlier_run' : 'found_in_this_run', row };\n\n  if (row.domain_key) domains.set(row.domain_key, 'run');\n  if (row.name_key && !names.has(row.name_key)) names.set(row.name_key, { where: 'run', hasDomain: Boolean(row.domain_key) });\n  row.angle = `${angle.area} · ${angle.industry} · ${angle.source} · ${angle.wording}`;\n  return { outcome: 'found', row };\n}\n\nstate.batch += 1;\nlet wait = 0;\nlet slowDown = false;\nconst again = [];\nconst asked = new Set();\n\nanswers.forEach((item, position) => {\n  const entry = batch[position].json;\n  const index = entry.angle_index;\n  const angle = state.angles[index];\n  asked.add(index);\n  state.attempts[index] = entry.attempt;\n  state.model_calls += 1;\n\n  const status = item.json.statusCode;\n  let body = item.json.body;\n  if (typeof body === 'string') {\n    try {\n      body = JSON.parse(body);\n    } catch {\n      body = null;\n    }\n  }\n  const usage = body?.usage ?? {};\n  state.input_tokens += Number(usage.input_tokens) || 0;\n  state.output_tokens += Number(usage.output_tokens) || 0;\n  state.total_tokens += Number(usage.total_tokens) || (Number(usage.input_tokens) || 0) + (Number(usage.output_tokens) || 0);\n  if (Array.isArray(body?.output)) state.web_searches += body.output.filter((part) => part?.type === 'web_search_call').length;\n\n  const line = { angle: index + 1, batch: state.batch, attempt: entry.attempt };\n  const retry = (reason, seconds) => {\n    again.push(index);\n    wait = Math.max(wait, seconds);\n    state.log.push({ ...line, outcome: 'retry', reason });\n  };\n  const backoff = Math.min(s.retry_wait_seconds * 2 ** (entry.attempt - 1), s.max_wait_seconds);\n\n  if (status === 429 || status === undefined || status >= 500) {\n    // Too many requests, API down or not reachable: wait and ask again.\n    const reason = status === 429 ? 'rate_limited' : status === undefined ? 'api_unreachable' : `api_error_${status}`;\n    if (status === 429) slowDown = true;\n    const header = Number(item.json.headers?.['retry-after']);\n    const seconds = Number.isFinite(header) && header > 0 ? Math.min(header, s.max_wait_seconds) : backoff;\n    if (entry.attempt < s.max_attempts) retry(reason, seconds);\n    else state.log.push({ ...line, outcome: 'rejected', reason });\n    return;\n  }\n  if (status !== 200) {\n    // 400, 401, 403, 404: the request itself is wrong (key, model, address). Asking 49 more times will not help.\n    state.fatal = `the model API answered HTTP ${status}${body?.error?.message ? `: ${String(body.error.message).slice(0, 200)}` : ''}`;\n    state.log.push({ ...line, outcome: 'rejected', reason: `api_error_${status}` });\n    return;\n  }\n\n  const verdict = judge(body, angle);\n  if (verdict.outcome === 'bad_json') {\n    // Not usable JSON: one more try, then give up on this angle.\n    if (entry.attempt < Math.min(2, s.max_attempts)) retry('bad_json', 0);\n    else state.log.push({ ...line, outcome: 'rejected', reason: 'bad_json' });\n    return;\n  }\n  const note = { ...line, outcome: verdict.outcome };\n  if (verdict.reason) note.reason = verdict.reason;\n  if (verdict.row?.company) note.company = verdict.row.company;\n  if (verdict.row?.source_url) note.source_url = verdict.row.source_url;\n  if (verdict.row?.source_date) note.source_date = verdict.row.source_date;\n  state.log.push(note);\n  if (verdict.outcome === 'found') state.found.push({ ...verdict.row, angle_number: index + 1 });\n});\n\n// Angles to ask again go back to the front of the queue.\nstate.queue = [...again, ...state.queue.filter((index) => !asked.has(index))];\n// After a \"too many requests\" the batches are half as big for the rest of the run.\nif (slowDown) state.concurrency = Math.max(1, Math.floor(state.concurrency / 2));\nstate.wait_seconds = Math.max(wait, state.queue.length ? s.pause_seconds : 0);\nstate.domains = [...domains].map(([key, where]) => [key, where]);\nstate.names = [...names].map(([key, value]) => [key, value.where, value.hasDomain]);\n\nif (state.fatal) state.stopped = 'api_error';\nelse if (state.found.length >= s.target) state.stopped = 'target_reached';\nelse if (state.queue.length === 0) state.stopped = 'angles_used_up';\nstate.more = !state.stopped;\n\nreturn [{ json: state }];"
+      },
+      "id": "d1fc8180-fdd9-4484-8003-0e937607af24",
+      "name": "Read answers",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2480,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "370e7f04-9823-4b49-8867-651480be729e",
+              "leftValue": "={{ $json.more }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {
+          "looseTypeValidation": true
+        }
+      },
+      "id": "ab11ec8f-90ed-475d-812a-a708eaf8621d",
+      "name": "More to do?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2700,
+        -100
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "64b41dd5-053e-4f7b-86de-7579e9bfbb8b",
+      "name": "Finish",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2960,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "02b0ff13-7c39-4a99-8109-de06d7c3a831",
+              "leftValue": "={{ $json.found.length > 0 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {
+          "looseTypeValidation": true
+        }
+      },
+      "id": "d99e98ac-413a-4ee4-80c3-2b04e33a70a9",
+      "name": "Any found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3180,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// One item per new company: the row that is saved.\nconst state = $('Finish').first().json;\nconst s = state.settings;\nreturn state.found.map((row) => ({\n  json: {\n    company: row.company,\n    website: row.website,\n    domain_key: row.domain_key,\n    name_key: row.name_key,\n    signal: row.signal,\n    source_url: row.source_url,\n    source_date: row.source_date,\n    angle: row.angle,\n    location: s.location,\n    intent_signal: s.intent_signal,\n    run_id: state.run_id,\n    found_at: state.started_at,\n  },\n}));"
+      },
+      "id": "bba03799-89ab-4be9-8c99-fb0e5e9c7f74",
+      "name": "Rows to write",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3400,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "scanner_companies"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "company": "={{ $json.company }}",
+            "website": "={{ $json.website }}",
+            "domain_key": "={{ $json.domain_key }}",
+            "name_key": "={{ $json.name_key }}",
+            "signal": "={{ $json.signal }}",
+            "source_url": "={{ $json.source_url }}",
+            "source_date": "={{ $json.source_date }}",
+            "angle": "={{ $json.angle }}",
+            "location": "={{ $json.location }}",
+            "intent_signal": "={{ $json.intent_signal }}",
+            "run_id": "={{ $json.run_id }}",
+            "found_at": "={{ $json.found_at }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "company",
+              "displayName": "company",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "website",
+              "displayName": "website",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "domain_key",
+              "displayName": "domain_key",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "name_key",
+              "displayName": "name_key",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "signal",
+              "displayName": "signal",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source_url",
+              "displayName": "source_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source_date",
+              "displayName": "source_date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "angle",
+              "displayName": "angle",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "location",
+              "displayName": "location",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "intent_signal",
+              "displayName": "intent_signal",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "run_id",
+              "displayName": "run_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "found_at",
+              "displayName": "found_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "bdb6f7b5-e254-4486-8046-291ad5a179e2",
+      "name": "Save company",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        3620,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// The columns that go to the sheet, in this order. Put the same names in row 1\n// of your sheet. Remove a line here to leave a column out.\nreturn $input.all().map((item) => ({\n  json: {\n    company: item.json.company,\n    website: item.json.website,\n    signal: item.json.signal,\n    source_url: item.json.source_url,\n    source_date: item.json.source_date,\n    angle: item.json.angle,\n    location: item.json.location,\n    intent_signal: item.json.intent_signal,\n    found_at: item.json.found_at,\n    run_id: item.json.run_id,\n  },\n}));"
+      },
+      "id": "8091810e-505a-42a7-81d9-793e700673c1",
+      "name": "Sheet row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3840,
+        -100
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "sheet",
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "url",
+          "value": ""
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Sheet1"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "7397d841-42a8-4700-8db7-b0112f3da1c6",
+      "name": "Append to Google Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        4060,
+        -100
+      ],
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// What the run did, counted from its log. Every model call is one log line,\n// and every angle that was tried ends as found, rejected or duplicate, so:\n//   model_calls  = angles_tried + retries\n//   angles_tried = found + rejected + duplicates\nconst state = $('Finish').first().json;\nconst s = state.settings;\nconst count = (list) => list.reduce((totals, key) => ({ ...totals, [key]: (totals[key] ?? 0) + 1 }), {});\n\nconst final = state.log.filter((line) => line.outcome !== 'retry');\nconst rejected = final.filter((line) => line.outcome === 'rejected');\nconst duplicates = final.filter((line) => line.outcome === 'duplicate');\nconst retries = state.log.filter((line) => line.outcome === 'retry');\nconst found = state.found.length;\n// Rows that came back from the save step (none when nothing was found).\nconst saved = $input.all().filter((item) => item.json && item.json.company).length;\n\nconst stoppedText = {\n  target_reached: `stopped early: the target of ${s.target} was reached`,\n  angles_used_up: 'all angles were tried',\n  api_error: `stopped: ${state.fatal}`,\n  invalid_input: `nothing was searched: ${state.error}`,\n}[state.stopped];\n\nreturn [\n  {\n    json: {\n      ok: state.stopped === 'target_reached' || state.stopped === 'angles_used_up',\n      run_id: state.run_id,\n      ran_at: state.started_at,\n      location: s.location,\n      intent_signal: s.intent_signal,\n      lookback_hours: s.lookback_hours,\n      target: s.target,\n      stopped: state.stopped,\n      error: state.error ?? state.fatal ?? null,\n      angles_planned: state.angles.length,\n      angles_tried: final.length,\n      angles_not_needed: state.angles.length - final.length,\n      found,\n      saved,\n      rejected: rejected.length,\n      rejected_why: count(rejected.map((line) => line.reason)),\n      duplicates: duplicates.length,\n      duplicates_why: count(duplicates.map((line) => line.reason)),\n      retries: retries.length,\n      retries_why: count(retries.map((line) => line.reason)),\n      model_calls: state.model_calls,\n      batches: state.batch,\n      web_searches: state.web_searches,\n      input_tokens: state.input_tokens,\n      output_tokens: state.output_tokens,\n      total_tokens: state.total_tokens,\n      known_before: state.earlier_count,\n      text: `${found} new ${found === 1 ? 'company' : 'companies'} from ${final.length} of ${state.angles.length} angles (${stoppedText}). Rejected ${rejected.length}, duplicates ${duplicates.length}, retries ${retries.length}. ${state.model_calls} model calls, ${state.total_tokens} tokens.`,\n      companies: state.found.map((row) => ({ company: row.company, website: row.website, signal: row.signal, source_url: row.source_url, source_date: row.source_date, angle_number: row.angle_number })),\n      log: state.log,\n    },\n  },\n];"
+      },
+      "id": "b9e72e94-8041-4c71-8504-7fa45cfa1863",
+      "name": "Run summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4300,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "row",
+        "operation": "insert",
+        "dataTableId": {
+          "__rl": true,
+          "mode": "name",
+          "value": "scanner_runs"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "run_id": "={{ $json.run_id }}",
+            "ran_at": "={{ $json.ran_at }}",
+            "location": "={{ $json.location }}",
+            "intent_signal": "={{ $json.intent_signal }}",
+            "lookback_hours": "={{ $json.lookback_hours }}",
+            "stopped": "={{ $json.stopped }}",
+            "angles_planned": "={{ $json.angles_planned }}",
+            "angles_tried": "={{ $json.angles_tried }}",
+            "found": "={{ $json.found }}",
+            "rejected": "={{ $json.rejected }}",
+            "duplicates": "={{ $json.duplicates }}",
+            "retries": "={{ $json.retries }}",
+            "model_calls": "={{ $json.model_calls }}",
+            "web_searches": "={{ $json.web_searches }}",
+            "input_tokens": "={{ $json.input_tokens }}",
+            "output_tokens": "={{ $json.output_tokens }}",
+            "total_tokens": "={{ $json.total_tokens }}",
+            "report": "={{ JSON.stringify({ text: $json.text, error: $json.error, rejected_why: $json.rejected_why, duplicates_why: $json.duplicates_why, retries_why: $json.retries_why }) }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "run_id",
+              "displayName": "run_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "ran_at",
+              "displayName": "ran_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "location",
+              "displayName": "location",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "intent_signal",
+              "displayName": "intent_signal",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "lookback_hours",
+              "displayName": "lookback_hours",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "stopped",
+              "displayName": "stopped",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "angles_planned",
+              "displayName": "angles_planned",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "angles_tried",
+              "displayName": "angles_tried",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "found",
+              "displayName": "found",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "rejected",
+              "displayName": "rejected",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "duplicates",
+              "displayName": "duplicates",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "retries",
+              "displayName": "retries",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "model_calls",
+              "displayName": "model_calls",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "web_searches",
+              "displayName": "web_searches",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "input_tokens",
+              "displayName": "input_tokens",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "output_tokens",
+              "displayName": "output_tokens",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "total_tokens",
+              "displayName": "total_tokens",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "report",
+              "displayName": "report",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "0048a21f-3366-4041-8872-d1ccbf755171",
+      "name": "Log run",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        4520,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: { ...$('Run summary').first().json, logged: Boolean($input.first().json.id) } }];"
+      },
+      "id": "41cc82f5-c592-41b3-8421-0dc6bcbc100e",
+      "name": "Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4740,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### The model call\n`POST {MODEL_BASE_URL}/responses` in the shape of the OpenAI Responses API with the built-in web search tool: `tools: [{ \"type\": \"web_search\" }]`, `tool_choice: \"required\"`, `include: [\"web_search_call.action.sources\"]` and a JSON schema in `text.format`. Doc: https://developers.openai.com/api/docs/guides/tools-web-search\n\nCreate a credential of type **OpenAI** named `Account Scanner Model` with your API key and pick it in **Search the web**.\n\nA \"too many requests\" answer (HTTP 429) is asked again after the time the API names in `Retry-After`, and the batches are half as big from then on. A wrong key or model name stops the run at once.\n\nEach call costs tokens **and** a web search fee. The run summary counts both. Try `RUNS = 3` first.",
+        "width": 700,
+        "height": 330,
+        "color": 5
+      },
+      "id": "e3352834-fce1-495a-8349-ff6195766176",
+      "name": "Model note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1560,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Google Sheets (switched off until you set it up)\nThe data table is the list that dedupe reads. The sheet is a copy for you.\n\n1. In your sheet, put these names in row 1: `company`, `website`, `signal`, `source_url`, `source_date`, `angle`, `location`, `intent_signal`, `found_at`, `run_id`.\n2. Open **Append to Google Sheet**, pick your Google Sheets credential, paste the address of the sheet into **Document** and set the name of the tab in **Sheet**.\n3. Activate the node (it is deactivated: select it and press `D`).\n\nOnly companies that are new in this run reach the node, so the sheet gets no duplicates as long as the data table is kept. This node was **not tested**: it needs a Google account.",
+        "width": 700,
+        "height": 330,
+        "color": 5
+      },
+      "id": "b69a4e39-2c10-433e-88ba-114cf76e6fe8",
+      "name": "Sheet note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        3560,
+        100
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Run by hand": {
+      "main": [
+        [
+          {
+            "node": "Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Or fill in the form": {
+      "main": [
+        [
+          {
+            "node": "Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Called by another workflow": {
+      "main": [
+        [
+          {
+            "node": "Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Settings": {
+      "main": [
+        [
+          {
+            "node": "Companies table",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Companies table": {
+      "main": [
+        [
+          {
+            "node": "Runs table",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Runs table": {
+      "main": [
+        [
+          {
+            "node": "Earlier companies",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Earlier companies": {
+      "main": [
+        [
+          {
+            "node": "Plan angles",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan angles": {
+      "main": [
+        [
+          {
+            "node": "Anything to search?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anything to search?": {
+      "main": [
+        [
+          {
+            "node": "Next batch",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Finish",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Next batch": {
+      "main": [
+        [
+          {
+            "node": "Pause first?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pause first?": {
+      "main": [
+        [
+          {
+            "node": "Wait",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Search the web",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait": {
+      "main": [
+        [
+          {
+            "node": "Search the web",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search the web": {
+      "main": [
+        [
+          {
+            "node": "Read answers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read answers": {
+      "main": [
+        [
+          {
+            "node": "More to do?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "More to do?": {
+      "main": [
+        [
+          {
+            "node": "Next batch",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Finish",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Finish": {
+      "main": [
+        [
+          {
+            "node": "Any found?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any found?": {
+      "main": [
+        [
+          {
+            "node": "Rows to write",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Run summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rows to write": {
+      "main": [
+        [
+          {
+            "node": "Save company",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save company": {
+      "main": [
+        [
+          {
+            "node": "Sheet row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sheet row": {
+      "main": [
+        [
+          {
+            "node": "Append to Google Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append to Google Sheet": {
+      "main": [
+        [
+          {
+            "node": "Run summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run summary": {
+      "main": [
+        [
+          {
+            "node": "Log run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log run": {
+      "main": [
+        [
+          {
+            "node": "Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "id": "acctScannerMain01"
+}

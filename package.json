@@ -1,0 +1,14 @@
+{
+  "name": "n8n-account-scanner",
+  "version": "1.0.0",
+  "private": true,
+  "description": "One-click account scanner for n8n: N different web-search angles, an exclusion list between batches, source and date checks, dedupe across runs. Tested on real n8n",
+  "license": "MIT",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test:e2e": "node scripts/e2e.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
